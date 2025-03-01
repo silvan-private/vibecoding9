@@ -633,44 +633,44 @@ class AudioProcessor:
 
     def _find_text_in_timerange(self, transcript, start, end):
         """Find transcribed text within time range with improved overlap detection"""
-        text_segments = []
+        logger.info(f"\nSearching for text between {TimeFormatter.format(start)} and {TimeFormatter.format(end)}")
+        logger.info(f"Number of transcript segments to search: {len(transcript.get('segments', []))}")
         
-        # Use TimeFormatter consistently
-        start_time = TimeFormatter.format(start, ms_precision=True)
-        end_time = TimeFormatter.format(end, ms_precision=True)
+        matching_text = []
         
-        logger.info(f"\nSearching for text between {start_time} and {end_time}")
-        logger.info(f"Number of transcript segments to search: {len(transcript['segments'])}")
+        if not transcript or 'segments' not in transcript:
+            return ""
         
-        # Debug: Print all transcript segments
         logger.info("\nAll transcript segments:")
-        for i, seg in enumerate(transcript["segments"]):
-            seg_start = TimeFormatter.format(seg['start'], ms_precision=True)
-            seg_end = TimeFormatter.format(seg['end'], ms_precision=True)
-            logger.info(f"Transcript {i}: {seg_start} -> {seg_end}: {seg['text'][:50]}...")
+        for i, seg in enumerate(transcript['segments']):
+            logger.info(f"Transcript {i}: {TimeFormatter.format(seg['start'])} -> {TimeFormatter.format(seg['end'])}: {seg['text']}")
         
-        for segment in transcript["segments"]:
-            segment_start = segment["start"]
-            segment_end = segment["end"]
-            seg_start_fmt = TimeFormatter.format(segment_start, ms_precision=True)
-            seg_end_fmt = TimeFormatter.format(segment_end, ms_precision=True)
-            
-            logger.info(f"\nChecking transcript segment: {seg_start_fmt} -> {seg_end_fmt}")
-            logger.info(f"Segment text: {segment['text']}")
-            logger.info(f"Checking overlap conditions:")
-            logger.info(f"1. segment_start ({seg_start_fmt}) <= end ({end_time}): {segment_start <= end}")
-            logger.info(f"2. segment_end ({seg_end_fmt}) >= start ({start_time}): {segment_end >= start}")
-            
-            # If there's any overlap between the segments
-            if (segment_start <= end and segment_end >= start):
-                logger.info(f"✓ Found overlapping segment!")
-                text_segments.append(segment["text"])
-            else:
-                logger.info("✗ No overlap found")
+        for segment in transcript['segments']:
+            # Check if segment overlaps with our time range
+            if segment['start'] <= end and segment['end'] >= start:
+                logger.info(f"\nChecking transcript segment: {TimeFormatter.format(segment['start'])} -> {TimeFormatter.format(segment['end'])}")
+                logger.info(f"Segment text: {segment['text']}")
+                
+                # If we have word-level timestamps, use them for more precise text selection
+                if 'words' in segment:
+                    matching_words = []
+                    for word_data in segment['words']:
+                        if word_data['start'] <= end and word_data['end'] >= start:
+                            matching_words.append(word_data['word'])
+                    if matching_words:
+                        matching_text.append(' '.join(matching_words))
+                else:
+                    # If no word timestamps, use the entire segment text
+                    matching_text.append(segment['text'])
+                
+                logger.info("Checking overlap conditions:")
+                logger.info(f"1. segment_start ({TimeFormatter.format(segment['start'])}) <= end ({TimeFormatter.format(end)}): {segment['start'] <= end}")
+                logger.info(f"2. segment_end ({TimeFormatter.format(segment['end'])}) >= start ({TimeFormatter.format(start)}): {segment['end'] >= start}")
+                logger.info("✓ Found overlapping segment!")
         
-        result = " ".join(text_segments)
-        logger.info(f"\nFinal text found: {result[:100]}..." if result else "No text found in this range")
-        return result
+        final_text = ' '.join(matching_text).strip()
+        logger.info(f"\nFinal text found: {final_text}")
+        return final_text
 
     def process_video(self, url, start_time=None, end_time=None):
         """Process video URL and extract speaker information with improved diarization"""
@@ -736,6 +736,7 @@ class AudioProcessor:
                 "temperature": 0.0,  # Use single temperature for faster-whisper
                 "condition_on_previous_text": True,
                 "vad_filter": True,
+                "word_timestamps": True,  # Enable word-level timestamps
                 "vad_parameters": {
                     "threshold": 0.1,        # More lenient
                     "min_speech_duration_ms": 100,
@@ -756,7 +757,8 @@ class AudioProcessor:
                     temperature=whisper_params["temperature"],
                     condition_on_previous_text=whisper_params["condition_on_previous_text"],
                     vad_filter=whisper_params["vad_filter"],
-                    vad_parameters=whisper_params["vad_parameters"]
+                    vad_parameters=whisper_params["vad_parameters"],
+                    word_timestamps=whisper_params["word_timestamps"]  # Add word timestamps parameter
                 )
                 # Convert generator to list immediately
                 segments = list(segments)
@@ -820,13 +822,27 @@ class AudioProcessor:
             # Process each segment and ensure valid timestamps
             for seg in segments:
                 if seg.text and seg.text.strip():  # Only include non-empty segments
-                    transcript['segments'].append({
+                    segment_data = {
                         "start": float(seg.start),
                         "end": float(seg.end),
                         "text": seg.text.strip(),
                         "avg_logprob": seg.avg_logprob,
                         "no_speech_prob": seg.no_speech_prob
-                    })
+                    }
+                    
+                    # Add word-level timestamps if available
+                    if hasattr(seg, 'words') and seg.words:
+                        segment_data["words"] = [
+                            {
+                                "word": word.word,
+                                "start": float(word.start),
+                                "end": float(word.end),
+                                "probability": float(word.probability)
+                            }
+                            for word in seg.words
+                        ]
+                    
+                    transcript['segments'].append(segment_data)
             
             logger.info(f"\nProcessed {len(transcript['segments'])} valid text segments")
             if transcript['segments']:
