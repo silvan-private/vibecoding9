@@ -43,15 +43,26 @@ class TimeFormatter:
     
     @staticmethod
     def format_timestamp(seconds: float) -> str:
-        """Alias for format() to maintain compatibility with whisper's format_timestamp
+        """Convert seconds to mm:ss.ms format.
         
         Args:
             seconds (float): Time in seconds
             
         Returns:
-            str: Formatted time string in HH:MM:SS.mmm format
+            str: Formatted time string in mm:ss.ms format
+            
+        Examples:
+            >>> TimeFormatter.format_timestamp(75.5)
+            '01:15.500'
+            >>> TimeFormatter.format_timestamp(0)
+            '00:00.000'
         """
-        return TimeFormatter.format(seconds, ms_precision=True)
+        if seconds < 0:
+            raise ValueError("Timestamp cannot be negative")
+            
+        minutes = int(seconds // 60)
+        remaining = seconds % 60
+        return f"{minutes:02d}:{remaining:06.3f}"
     
     @staticmethod
     def parse(time_str: str) -> float:
@@ -72,6 +83,28 @@ class TimeFormatter:
         except ValueError as e:
             logger.error(f"Error parsing time string {time_str}: {str(e)}")
             raise
+
+    @staticmethod
+    def parse_timestamp(timestamp: str) -> float:
+        """Convert mm:ss.ms format to seconds.
+        
+        Args:
+            timestamp (str): Time string in mm:ss.ms format
+            
+        Returns:
+            float: Time in seconds
+            
+        Examples:
+            >>> TimeFormatter.parse_timestamp("01:15.500")
+            75.5
+            >>> TimeFormatter.parse_timestamp("00:00.000")
+            0.0
+        """
+        try:
+            minutes, seconds = timestamp.split(":")
+            return int(minutes) * 60 + float(seconds)
+        except (ValueError, AttributeError) as e:
+            raise ValueError(f"Invalid timestamp format: {timestamp}. Expected mm:ss.ms") from e
 
 def test_time_formatter():
     """Test the TimeFormatter class with various inputs"""
@@ -103,6 +136,9 @@ def test_time_formatter():
         pass
         
     print("All timestamp tests passed!")
+
+# For backwards compatibility
+format_timestamp = TimeFormatter.format_timestamp
 
 if __name__ == "__main__":
     test_time_formatter() 

@@ -1,61 +1,93 @@
-# Voice Analysis Tool
+# Speaker Detection and Transcription System
 
-A Python tool for analyzing speaker voice prints from YouTube videos. This tool can extract speaker voice prints and analyze videos to find matching segments.
+A Python-based system for analyzing videos, detecting speakers, and generating transcripts with speaker identification.
 
 ## Features
 
-- Extract speaker voice prints from YouTube video segments
-- Analyze videos to find segments matching a voice print
-- Support for caching audio files
-- Test mode for quick verification
-- Detailed logging and diagnostics
-
-## Requirements
-
-- Python 3.8+
-- FFmpeg installed and in PATH
-- Required Python packages (see requirements.txt)
+- Speaker identification using ECAPA-TDNN model
+- Audio transcription using OpenAI's Whisper model
+- Multiple output formats:
+  - Raw transcripts with timestamps
+  - Grouped transcripts by speaker
+  - Interactive HTML viewer
+- Speaker similarity scoring
+- Progress tracking and logging
+- Video segment analysis
+- Caching of downloaded audio and embeddings
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/silvan-private/vibecoding9.git
-cd vibecoding9
+git clone <repository-url>
+cd speaker-detection
 ```
 
-2. Install required packages:
+2. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
 ## Usage
 
-Run the interactive menu:
-```bash
-python run_voice_analysis.py
+### Basic Usage
+
+```python
+# Analyze a video with speaker detection
+python analyze_speaker.py
 ```
 
-Available operations:
-1. Extract Speaker Voice Print
-2. Analyze Video with Existing Voice Print
-3. Full Process (Extract and Analyze)
-4. View Saved Voice Prints
-5. Exit
-6. Test Extract (Pre-filled values)
+### Testing Speaker Detection
+
+```python
+# Test speaker detection on a specific segment
+python test_speaker_detection.py
+```
 
 ## Project Structure
 
-- `run_voice_analysis.py`: Main script with interactive menu
-- `audio_processor.py`: Core audio processing functionality
-- `utils/`: Utility functions and helpers
-  - `time_helpers.py`: Time formatting utilities
+- `analyze_speaker.py`: Main script for video analysis
+- `test_speaker_detection.py`: Script for testing speaker detection
+- `speaker_data/`: Directory for storing outputs
+  - `models/`: Cached ML models
+  - `cache/`: Downloaded audio files
+  - `embeddings/`: Speaker embeddings
+  - `transcripts/`: Generated transcripts
 
-## Models Used
+## Output Formats
 
-- Whisper (tiny.en) for transcription
-- ECAPA-TDNN for voice embeddings
-- Wav2Vec2 for audio processing
+1. **Raw Transcript** (`raw.txt`):
+   - Detailed transcript with timestamps
+   - Speaker identification and confidence scores
+   - Individual segments
+
+2. **Grouped Transcript** (`grouped.txt`):
+   - Segments grouped by speaker
+   - Merged consecutive segments from same speaker
+   - Average confidence scores
+
+3. **HTML Viewer** (`viewer.html`):
+   - Interactive web interface
+   - Styled transcript display
+   - Speaker highlighting
+   - Timestamp navigation
+
+## Technical Details
+
+- Speaker Recognition: ECAPA-TDNN model from SpeechBrain
+- Transcription: OpenAI's Whisper model
+- Audio Processing: librosa and soundfile
+- Similarity Threshold: 0.75 (configurable)
+- Chunk Duration: 30 seconds
+
+## Dependencies
+
+- PyTorch
+- SpeechBrain
+- OpenAI Whisper
+- yt-dlp
+- scikit-learn
+- And more (see requirements.txt)
 
 ## License
 

@@ -1,46 +1,23 @@
 import os
-# Set environment variables before importing speechbrain
-os.environ['HF_HUB_ENABLE_SYMLINKS'] = '0'
-os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
-os.environ['HF_HOME'] = './pretrained_models/huggingface'
-os.environ['SPEECHBRAIN_CACHE_DIR'] = './pretrained_models/speechbrain'
+# Only set essential environment variables
+os.environ['HF_HOME'] = './huggingface_cache'
+os.environ['SPEECHBRAIN_CACHE_DIR'] = './model_cache'
 
 import sys
 import logging
-
-# Debug Python path and module locations
-logger = logging.getLogger(__name__)
-logger.info("="*80)
-logger.info("MODULE IMPORT DIAGNOSTICS")
-logger.info("="*80)
-logger.info(f"Python Path: {sys.path}")
-try:
-    import whisper
-    logger.info(f"Whisper Module: {whisper.__file__}")
-    logger.info(f"Whisper Utils: {whisper.utils.__file__}")
-except ImportError:
-    logger.info("Whisper module not found")
-try:
-    import whisper_timestamped
-    logger.info(f"Whisper Timestamped Module: {whisper_timestamped.__file__}")
-except ImportError:
-    logger.info("Whisper Timestamped module not found")
-logger.info("="*80)
-
 import torch
 import torchaudio
 import numpy as np
 from pathlib import Path
 import yt_dlp
 from pydub import AudioSegment
-from faster_whisper import WhisperModel
+import whisper
 import time
-from transformers import Wav2Vec2Processor, Wav2Vec2Model
 import requests
 from yt_dlp import YoutubeDL
 import json
 from datetime import datetime
-from speechbrain.pretrained import EncoderClassifier
+from speechbrain.inference import EncoderClassifier
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import SpectralClustering
 import soundfile as sf
@@ -49,9 +26,28 @@ import matplotlib.pyplot as plt
 import argparse
 import shutil
 from huggingface_hub import hf_hub_download
-from speechbrain.utils.fetching import fetch
 import traceback
 from utils.time_helpers import TimeFormatter
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from contextlib import nullcontext
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+
+@dataclass
+class ProcessedChunk:
+    """Class to hold processed chunk data."""
+    embedding: np.ndarray
+    segments: List[Dict[str, Any]]
+    start_time: float
+    duration: float
+
+# Configure device and optimization settings
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+NUM_THREADS = min(multiprocessing.cpu_count(), 8)  # Use up to 8 CPU threads
+ENABLE_FP16 = DEVICE.type == 'cuda'  # Enable FP16 on GPU only
+CHUNK_DURATION = 30.0  # Process in 30-second chunks
+SAMPLE_RATE = 16000  # 16kHz sample rate for models
 
 # Configure logging with more detailed format
 logging.basicConfig(
@@ -65,14 +61,63 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Ensure logger level is set to INFO
 
-def download_model_files():
+# Create a minimal custom.py module
+def create_custom_module(model_dir):
+    """Create a minimal custom.py module for SpeechBrain"""
+    custom_py = model_dir / "custom.py"
+    if not custom_py.exists():
+        with open(custom_py, "w") as f:
+            f.write("""
+# Minimal custom module for SpeechBrain
+def custom_func(*args, **kwargs):
+    pass
+""")
+    return custom_py
+
+# Patch SpeechBrain's file handling to use copying instead of symlinks
+import speechbrain.utils.fetching as sb_fetching
+def safe_link_strategy(src, dst):
+    """Safe linking strategy that uses copying instead of symlinks"""
+    try:
+        # Convert to Path objects and resolve
+        src_path = Path(src).resolve()
+        dst_path = Path(dst).resolve()
+        
+        # Create parent directory if it doesn't exist
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # If source is custom.py and doesn't exist, create it
+        if src_path.name == "custom.py" and not src_path.exists():
+            src_path = create_custom_module(src_path.parent)
+        
+        # Check if source exists
+        if not src_path.exists():
+            raise FileNotFoundError(f"Source file not found: {src_path}")
+        
+        # Copy file
+        logger.info(f"Copying {src_path} -> {dst_path}")
+        shutil.copy2(str(src_path), str(dst_path))
+        return dst_path
+        
+    except Exception as e:
+        logger.error(f"Error copying file: {str(e)}")
+        raise
+
+# Override SpeechBrain's file handling
+sb_fetching.SYMLINK_STRATEGY = "copy"
+sb_fetching.link_with_strategy = lambda src, dst, _: safe_link_strategy(src, dst)
+
+def download_model_files(model_dir):
     """Download ECAPA-TDNN model files with Windows-safe copy operations"""
     try:
         # Setup directories
-        model_dir = Path("./pretrained_models/ecapa-tdnn").resolve()
-        cache_dir = Path("./pretrained_models/huggingface").resolve()
+        model_dir = Path(model_dir).resolve()
+        cache_dir = model_dir / "cache"
         model_dir.mkdir(parents=True, exist_ok=True)
         cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create custom module
+        create_custom_module(model_dir)
         
         # Define model files to download
         model_files = {
@@ -100,7 +145,7 @@ def download_model_files():
                     )
                     
                     # Copy file to final location
-                    shutil.copy2(tmp_file, target_file)
+                    safe_link_strategy(tmp_file, target_file)
                     logger.info(f"✓ Successfully downloaded and copied {local_file}")
                     
                 except Exception as e:
@@ -113,14 +158,6 @@ def download_model_files():
             logger.error(f"Missing required files: {missing_files}")
             return False
         
-        # Verify file permissions
-        for file_name in model_files.keys():
-            file_path = model_dir / file_name
-            if not os.access(file_path, os.R_OK):
-                logger.error(f"Cannot read file: {file_name}")
-                return False
-        
-        logger.info("✓ All model files downloaded and verified successfully")
         return True
         
     except Exception as e:
@@ -128,67 +165,252 @@ def download_model_files():
         return False
 
 class AudioProcessor:
-    def __init__(self, output_dir="speaker_data", embedding_dir="embeddings", mode="diarize", target_embedding=None, test_mode=False):
-        logger.info("Initializing AudioProcessor...")
-        # Resolve absolute paths
-        self.output_dir = Path(output_dir).resolve()
-        self.embedding_dir = (self.output_dir / embedding_dir).resolve()
-        
-        # Create directories
-        self.output_dir.mkdir(exist_ok=True)
-        self.embedding_dir.mkdir(exist_ok=True)
-        
-        # Create cache directories
-        self.cache_dir = Path("./cache").resolve()
-        self.cache_dir.mkdir(exist_ok=True)
-        for cache_dir in ['./pretrained_models/huggingface', './pretrained_models/speechbrain', './cache']:
-            Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        
-        self.mode = mode
-        self.target_embedding = target_embedding
-        self.progress_callback = None
-        self.test_mode = test_mode  # Add test mode flag
-        
-        # Initialize models
-        logger.info("Loading Whisper model...")
-        self.whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-        logger.info("Whisper model loaded successfully")
-        
-        # Load ECAPA-TDNN model with direct file copying
-        logger.info("Loading ECAPA-TDNN model...")
+    def __init__(self, output_dir: Optional[Path] = None):
+        """Initialize the audio processor."""
         try:
-            # Create directories if they don't exist
-            model_dir = Path("./pretrained_models/ecapa-tdnn").resolve()
-            model_dir.mkdir(parents=True, exist_ok=True)
+            # Set up logging
+            self.logger = logging.getLogger(__name__)
             
-            # First, download the model files
-            if not download_model_files():
-                raise Exception("Failed to download model files")
+            # Set up output directory
+            self.output_dir = Path(output_dir or "speaker_data")
+            self.output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Initialize the classifier with local files
-            self.classifier = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir=str(model_dir),  # Convert to string to avoid Path issues
-                run_opts={"device": "cpu"}
+            # Create required subdirectories
+            self.models_dir = self.output_dir / "models"
+            self.cache_dir = self.output_dir / "cache"
+            self.embeddings_dir = self.output_dir / "embeddings"
+            
+            for directory in [self.models_dir, self.cache_dir, self.embeddings_dir]:
+                directory.mkdir(parents=True, exist_ok=True)
+            
+            # Initialize models
+            self.logger.info("Loading Whisper model on cpu...")
+            self.whisper = whisper.load_model("base", device=DEVICE)
+            self.logger.info("Whisper model loaded successfully")
+            
+            # Initialize ECAPA-TDNN model
+            self.logger.info("Loading ECAPA-TDNN model on cpu...")
+            self.classifier = self._load_ecapa_tdnn()
+            self.logger.info("ECAPA-TDNN model loaded successfully")
+            
+            # Initialize reference speaker
+            self.reference_embedding = None
+            self.similarity_threshold = 0.65  # Lower threshold for better matching
+            
+        except Exception as e:
+            self.logger.error(f"Error initializing AudioProcessor: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            raise
+
+    def set_reference_speaker(self, speaker_id: str) -> bool:
+        """Set the reference speaker for comparison."""
+        try:
+            # Load embedding from file
+            embedding_file = self.embeddings_dir / f"speaker_{speaker_id}.npz"
+            if not embedding_file.exists():
+                self.logger.error(f"No embedding file found for speaker {speaker_id}")
+                return False
+            
+            # Load embedding
+            data = np.load(str(embedding_file))
+            self.reference_embedding = data['embedding']
+            self.logger.info(f"Set reference speaker {speaker_id} with embedding shape {self.reference_embedding.shape}")
+            return True
+        
+        except Exception as e:
+            self.logger.error(f"Error setting reference speaker: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
+
+    def process_chunk(self, chunk: np.ndarray, chunk_start: float = 0.0) -> Optional[ProcessedChunk]:
+        """Process a single chunk of audio data."""
+        try:
+            self.logger.info(f"\nProcessing chunk starting at {chunk_start:.2f}s")
+            self.logger.info(f"Chunk shape: {chunk.shape}, dtype: {chunk.dtype}")
+            self.logger.info(f"Chunk stats - min: {chunk.min():.3f}, max: {chunk.max():.3f}, mean: {chunk.mean():.3f}")
+            
+            # First extract voice embedding
+            self.logger.info("Extracting voice embedding...")
+            try:
+                if self.classifier is None:
+                    self.logger.error("ECAPA-TDNN classifier is not initialized")
+                    return None
+                    
+                embedding = self._extract_voice_embedding(chunk)
+                if embedding is None:
+                    self.logger.error("Voice embedding extraction failed - no embedding returned")
+                    return None
+                self.logger.info(f"Embedding extracted with shape {embedding.shape}")
+            except Exception as e:
+                self.logger.error(f"Voice embedding extraction failed with error: {str(e)}")
+                self.logger.error("Full traceback:")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                return None
+
+            # Then transcribe
+            self.logger.info("Transcribing audio...")
+            try:
+                if self.whisper is None:
+                    self.logger.error("Whisper model is not initialized")
+                    return None
+                    
+                result = self._transcribe_audio(chunk)
+                if not result or not result.get('segments'):
+                    self.logger.error("Transcription failed - no segments returned")
+                    return None
+                self.logger.info(f"Transcription completed with {len(result['segments'])} segments")
+            except Exception as e:
+                self.logger.error(f"Transcription failed with error: {str(e)}")
+                self.logger.error("Full traceback:")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                return None
+
+            # Process segments
+            try:
+                matching_segments = []
+                for segment in result['segments']:
+                    # Add chunk_start to segment times
+                    segment['start'] += chunk_start
+                    segment['end'] += chunk_start
+                    
+                    # Calculate similarity if we have a reference embedding
+                    if self.reference_embedding is not None:
+                        similarity = cosine_similarity(
+                            embedding.reshape(1, -1),
+                            self.reference_embedding.reshape(1, -1)
+                        )[0][0]
+                        
+                        # Log similarity score for each segment
+                        self.logger.info(f"\nSegment {TimeFormatter.format(segment['start'])} -> {TimeFormatter.format(segment['end'])}")
+                        self.logger.info(f"Text: {segment['text']}")
+                        self.logger.info(f"Similarity score: {similarity:.4f} (threshold: {self.similarity_threshold:.4f})")
+                        
+                        if similarity >= self.similarity_threshold:
+                            segment['similarity'] = float(similarity)
+                            matching_segments.append(segment)
+                            self.logger.info("✓ Segment matched!")
+                        else:
+                            self.logger.info("✗ Segment below threshold")
+                    else:
+                        # If no reference embedding, keep all segments
+                        matching_segments.append(segment)
+
+                self.logger.info(f"\nFound {len(matching_segments)} matching segments in chunk")
+                
+                return ProcessedChunk(
+                    embedding=embedding,
+                    segments=matching_segments,
+                    start_time=chunk_start,
+                    duration=len(chunk) / SAMPLE_RATE
+                )
+            except Exception as e:
+                self.logger.error(f"Error processing segments: {str(e)}")
+                self.logger.error("Full traceback:")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                return None
+            
+        except Exception as e:
+            self.logger.error(f"Unexpected error in process_chunk: {str(e)}")
+            self.logger.error("Full traceback:")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return None
+
+    def _transcribe_audio(self, audio_data: np.ndarray) -> Optional[dict]:
+        """Transcribe audio data using Whisper."""
+        try:
+            self.logger.info("Starting Whisper transcription...")
+            
+            # Convert to float32 if not already
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
+            # Normalize audio to [-1, 1] range if not already
+            if np.abs(audio_data).max() > 1.0:
+                audio_data = audio_data / np.abs(audio_data).max()
+                
+            # Run transcription
+            result = self.whisper.transcribe(
+                audio_data,
+                language='en',
+                task='transcribe',
+                fp16=ENABLE_FP16 and DEVICE.type == 'cuda'
             )
             
-            logger.info("ECAPA-TDNN model loaded successfully")
+            if not result or not isinstance(result, dict):
+                self.logger.error("Transcription failed - invalid result format")
+                return None
+                
+            if 'segments' not in result:
+                self.logger.error("Transcription failed - no segments in result")
+                return None
+                
+            return result
             
         except Exception as e:
-            logger.error(f"Error loading ECAPA-TDNN model: {str(e)}")
-            raise
-        
-        # Initialize speaker recognition with Wav2Vec2
+            self.logger.error(f"Error in transcription: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return None
+
+    def _extract_voice_embedding(self, audio_data: np.ndarray) -> Optional[np.ndarray]:
+        """Extract voice embedding from audio data."""
         try:
-            logger.info("Initializing audio processing model...")
-            self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-            self.audio_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
-            self.audio_model.eval()  # Set to evaluation mode
-            logger.info("Audio processing model initialized successfully")
+            self.logger.info("Starting voice embedding extraction...")
+            
+            # Convert to float32 if not already
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
+            # Apply preprocessing steps
+            # 1. Normalize audio to [-1, 1] range first
+            audio_data = librosa.util.normalize(audio_data)
+            
+            # 2. Apply voice activity detection to remove silence
+            intervals = librosa.effects.split(
+                audio_data,
+                top_db=20,  # More lenient threshold
+                frame_length=2048,
+                hop_length=512
+            )
+            
+            if len(intervals) > 0:
+                # Concatenate non-silent intervals
+                audio_data = np.concatenate([audio_data[start:end] for start, end in intervals])
+                self.logger.info(f"After VAD: kept {len(audio_data)/SAMPLE_RATE:.2f}s of audio")
+            
+            # 3. Pre-emphasis filter to boost high frequencies
+            audio_data = librosa.effects.preemphasis(audio_data, coef=0.95)
+            
+            # Convert to tensor and add batch dimension
+            waveform = torch.tensor(audio_data).unsqueeze(0)
+            
+            # Move to device and convert to FP16 if enabled
+            with torch.no_grad():
+                waveform = waveform.to(DEVICE)
+                if ENABLE_FP16 and DEVICE.type == 'cuda':
+                    waveform = waveform.half()
+                
+                # Extract embedding
+                embedding = self.classifier.encode_batch(waveform)
+                embedding = embedding.cpu().numpy()
+                
+                if embedding is None or embedding.size == 0:
+                    self.logger.error("Embedding extraction failed - empty result")
+                    return None
+                    
+                return embedding.squeeze()
+                
         except Exception as e:
-            logger.error(f"Error initializing audio processing model: {str(e)}")
-            print("Error initializing audio processing model. Please ensure you have internet access.")
-            raise e
+            self.logger.error(f"Error in voice embedding extraction: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return None
 
     def set_progress_callback(self, callback):
         """Set a callback function to report progress"""
@@ -216,8 +438,18 @@ class AudioProcessor:
         logger.info(f"Looking for cache file: {cache_file}")
         
         if cache_file.exists():
-            logger.info(f"✓ Cache hit! Found cached audio file: {cache_file}")
-            return str(cache_file)
+            # Verify the cached file
+            try:
+                audio_data, sr = sf.read(str(cache_file))
+                duration = len(audio_data) / sr
+                if end_seconds != float('inf') and duration < end_seconds:
+                    logger.info(f"Cache file too short ({duration:.2f}s < {end_seconds:.2f}s) - will re-download")
+                    return None
+                logger.info(f"✓ Cache hit! Found cached audio file: {cache_file}")
+                return str(cache_file)
+            except Exception as e:
+                logger.error(f"Error verifying cache file: {str(e)}")
+                return None
         
         logger.info("✗ Cache miss - will need to download")
         return None
@@ -531,48 +763,6 @@ class AudioProcessor:
             logger.error(f"Error creating audio embedding: {str(e)}")
             return None
 
-    def _extract_voice_embedding(self, audio_segment):
-        """Extract ECAPA-TDNN embedding from audio segment"""
-        try:
-            # Convert tensor to numpy and ensure correct shape
-            if isinstance(audio_segment, torch.Tensor):
-                audio_np = audio_segment.squeeze().numpy()
-            else:
-                audio_np = audio_segment
-            
-            # Ensure audio is mono
-            if len(audio_np.shape) > 1 and audio_np.shape[0] > 1:
-                audio_np = audio_np[0]
-            
-            # Apply preprocessing
-            audio_np = librosa.util.normalize(audio_np)
-            audio_np = librosa.effects.preemphasis(audio_np)
-            
-            # Convert to torch tensor and add batch dimension
-            audio_tensor = torch.FloatTensor(audio_np).unsqueeze(0)
-            
-            # Extract embedding
-            with torch.no_grad():
-                embedding = self.classifier.encode_batch(audio_tensor)
-                embedding_np = embedding.squeeze().cpu().numpy()
-            
-            # Plot embedding distribution for debugging
-            if not hasattr(self, '_embedding_count'):
-                self._embedding_count = 0
-            self._embedding_count += 1
-            
-            if self._embedding_count % 10 == 0:  # Plot every 10th embedding
-                plt.figure(figsize=(6, 6))
-                plt.scatter(embedding_np[:50], embedding_np[50:100])
-                plt.title(f"Embedding Distribution (Sample {self._embedding_count})")
-                plt.savefig(str(self.output_dir / f"debug_embedding_{self._embedding_count}.png"))
-                plt.close()
-            
-            return embedding_np
-        except Exception as e:
-            logger.error(f"Error extracting voice embedding: {str(e)}")
-            return None
-
     def _compute_similarity(self, embedding1, embedding2):
         """Compute cosine similarity between two embeddings"""
         return cosine_similarity(embedding1.reshape(1, -1), embedding2.reshape(1, -1))[0][0]
@@ -581,7 +771,7 @@ class AudioProcessor:
         """Save speaker embedding to file"""
         try:
             # Ensure both paths are absolute and normalized
-            embedding_path = (self.embedding_dir / f"{speaker_id}_ecapa.npz").resolve()
+            embedding_path = (self.embeddings_dir / f"{speaker_id}_ecapa.npz").resolve()
             output_dir_path = self.output_dir.resolve()
             
             # Save the embedding
@@ -595,41 +785,18 @@ class AudioProcessor:
             # Fallback: return the path relative to embeddings dir
             return f"embeddings/{speaker_id}_ecapa.npz"
 
-    def _cluster_speakers(self, embeddings, max_speakers=5):
-        """Cluster speaker embeddings using extremely conservative thresholds"""
-        if len(embeddings) < 2:
-            return [0] * len(embeddings)
-        
-        # Compute similarity matrix
-        similarity_matrix = cosine_similarity(embeddings)
-        
-        # Force very conservative speaker count
-        similarity_threshold = 0.3  # Extremely low threshold to merge speakers
-        
-        # Always start with minimum speakers
-        estimated_speakers = 1  # Force single speaker
-        
-        # Initialize clustering with minimum speakers
-        clustering = SpectralClustering(
-            n_clusters=estimated_speakers,
-            affinity='precomputed',
-            random_state=42,
-            n_init=100,
-            assign_labels='discretize'
-        )
-        
-        # Normalize similarity matrix
-        similarity_matrix = np.maximum(similarity_matrix, similarity_matrix.T)
-        np.fill_diagonal(similarity_matrix, 1.0)
-        
-        # Debug logging for similarity matrix
-        logger.info(f"Similarity matrix stats - Mean: {np.mean(similarity_matrix):.3f}, Min: {np.min(similarity_matrix):.3f}, Max: {np.max(similarity_matrix):.3f}")
-        
-        # Fit and predict
-        labels = clustering.fit_predict(similarity_matrix)
-        
-        # Force all segments to same speaker
-        return np.zeros_like(labels)  # Return all zeros to assign everything to first speaker
+    def _cluster_speakers(self, embeddings, reference_embedding=None, similarity_threshold=0.75):
+        """Compare embeddings against reference speaker"""
+        if reference_embedding is not None:
+            # Compare each segment against reference embedding
+            similarities = cosine_similarity(embeddings, reference_embedding.reshape(1, -1))
+            # Assign segments to speaker if similarity exceeds threshold
+            labels = (similarities.squeeze() >= similarity_threshold).astype(int)
+            logger.info(f"Found {np.sum(labels)} segments matching reference speaker")
+            return labels
+        else:
+            # If no reference, treat all as same speaker
+            return np.zeros(len(embeddings))
 
     def _find_text_in_timerange(self, transcript, start, end):
         """Find transcribed text within time range with improved overlap detection"""
@@ -672,315 +839,342 @@ class AudioProcessor:
         logger.info(f"\nFinal text found: {final_text}")
         return final_text
 
-    def process_video(self, url, start_time=None, end_time=None):
-        """Process video URL and extract speaker information with improved diarization"""
-        start_time = start_time or 0
-        end_time = end_time or float('inf')
-        
-        start_processing = time.time()
-        logger.info("="*80)
-        logger.info("STARTING VIDEO PROCESSING")
-        logger.info(f"URL: {url}")
-        logger.info(f"Time range: {start_time} to {end_time}")
-        logger.info(f"Test mode: {'ENABLED' if self.test_mode else 'DISABLED'}")
-        logger.info("="*80)
-
-        # Initialize format_timestamp at the start
+    def process_video(self, url, start_time=None, end_time=None, speaker_id=None, progress_callback=None):
+        """Process a video segment to extract voice print and transcription."""
         try:
-            from whisper.utils import format_timestamp
-            logger.info("[SUCCESS] OpenAI whisper format_timestamp found")
-        except ImportError:
-            try:
-                from whisper_timestamped import format_timestamp
-                logger.info("[SUCCESS] whisper-timestamped format_timestamp found")
-            except ImportError:
-                logger.info("[FAIL] No format_timestamp in standard locations")
-                def format_timestamp(seconds: float):
-                    return f"{seconds:.2f}s"
-                logger.info("[INFO] Using basic format_timestamp implementation")
-        
-        # Make format_timestamp available globally
-        globals()['format_timestamp'] = format_timestamp
-
-        # Test the format_timestamp function
-        test_time = 123.456
-        try:
-            formatted = format_timestamp(test_time)
-            logger.info(f"[TEST] format_timestamp({test_time}) = {formatted}")
-        except Exception as e:
-            logger.error(f"[TEST] format_timestamp test failed: {str(e)}")
-
-        try:
-            # Download and prepare audio
-            logger.info("\n[1] Downloading audio...")
-            audio_path = self.download_audio(url, start_time, end_time)
+            # Download video
+            if progress_callback:
+                progress_callback(0)
+            logger.info(f"Downloading video: {url}")
             
-            # Generate transcript using Whisper
-            logger.info("\n[1.5] Generating transcript...")
-            logger.info("Audio file being transcribed: %s", audio_path)
-            
-            # Verify audio file before transcription
-            try:
-                audio_info = sf.info(audio_path)
-                logger.info("Audio file verification:")
-                logger.info(f"- Duration: {audio_info.duration:.2f} seconds")
-                logger.info(f"- Sample rate: {audio_info.samplerate} Hz")
-                logger.info(f"- Channels: {audio_info.channels}")
-            except Exception as e:
-                logger.error(f"Error verifying audio file: {str(e)}")
-            
-            # Set Whisper parameters for better results on short segments
-            whisper_params = {
-                "beam_size": 5,
-                "best_of": 5,
-                "temperature": 0.0,  # Use single temperature for faster-whisper
-                "condition_on_previous_text": True,
-                "vad_filter": True,
-                "word_timestamps": True,  # Enable word-level timestamps
-                "vad_parameters": {
-                    "threshold": 0.1,        # More lenient
-                    "min_speech_duration_ms": 100,
-                    "max_speech_duration_s": 10,
-                    "min_silence_duration_ms": 50
-                }
-            }
-            
-            logger.info("\nStarting Whisper transcription with parameters:")
-            for k, v in whisper_params.items():
-                logger.info(f"- {k}: {v}")
-            
-            try:
-                segments, info = self.whisper_model.transcribe(
-                    audio_path,
-                    beam_size=whisper_params["beam_size"],
-                    best_of=whisper_params["best_of"],
-                    temperature=whisper_params["temperature"],
-                    condition_on_previous_text=whisper_params["condition_on_previous_text"],
-                    vad_filter=whisper_params["vad_filter"],
-                    vad_parameters=whisper_params["vad_parameters"],
-                    word_timestamps=whisper_params["word_timestamps"]  # Add word timestamps parameter
-                )
-                # Convert generator to list immediately
-                segments = list(segments)
-                logger.info("\nWhisper transcription completed")
-                logger.info(f"Info returned: {info}")
-                logger.info(f"Number of segments: {len(segments)}")
-                
-                # Debug: Print raw segment attributes
-                if segments:
-                    logger.info("\nFirst segment attributes:")
-                    first_seg = segments[0]
-                    for attr in dir(first_seg):
-                        if not attr.startswith('_'):
-                            try:
-                                value = getattr(first_seg, attr)
-                                logger.info(f"- {attr}: {value}")
-                            except Exception as e:
-                                logger.info(f"- {attr}: <error getting value: {e}>")
-                
-                for i, seg in enumerate(segments):
-                    logger.info(f"Segment {i}:")
-                    logger.info(f"- Time: {seg.start:.2f}s -> {seg.end:.2f}s")
-                    logger.info(f"- Text: '{seg.text}'")
-                    logger.info(f"- Word count: {len(seg.text.split())}")
-                    logger.info(f"- Avg logprob: {seg.avg_logprob}")
-                    logger.info(f"- No speech prob: {seg.no_speech_prob}")
-            except Exception as e:
-                logger.error(f"Error during transcription: {str(e)}")
-                logger.error(traceback.format_exc())
-                raise
-            
-            # Convert faster_whisper segments to our format and add debug logging
-            logger.info("\nTranscript Generation Details:")
-            logger.info("-" * 50)
-            logger.info("Raw segments from Whisper:")
-            
-            # Debug: Print raw segment attributes
-            if segments:  # Changed from len(segments) > 0
-                logger.info("\nFirst segment attributes:")
-                first_seg = segments[0]
-                for attr in dir(first_seg):
-                    if not attr.startswith('_'):
-                        try:
-                            value = getattr(first_seg, attr)
-                            logger.info(f"- {attr}: {value}")
-                        except Exception as e:
-                            logger.info(f"- {attr}: <error getting value: {e}>")
-            
-            for i, seg in enumerate(segments):
-                logger.info(f"Segment {i}:")
-                logger.info(f"- Time: {seg.start:.2f}s -> {seg.end:.2f}s")
-                logger.info(f"- Text: '{seg.text}'")
-                logger.info(f"- Word count: {len(seg.text.split())}")
-                logger.info(f"- Avg logprob: {seg.avg_logprob}")
-                logger.info(f"- No speech prob: {seg.no_speech_prob}")
-                
-            transcript = {
-                'segments': []
-            }
-            
-            # Process each segment and ensure valid timestamps
-            for seg in segments:
-                if seg.text and seg.text.strip():  # Only include non-empty segments
-                    segment_data = {
-                        "start": float(seg.start),
-                        "end": float(seg.end),
-                        "text": seg.text.strip(),
-                        "avg_logprob": seg.avg_logprob,
-                        "no_speech_prob": seg.no_speech_prob
-                    }
-                    
-                    # Add word-level timestamps if available
-                    if hasattr(seg, 'words') and seg.words:
-                        segment_data["words"] = [
-                            {
-                                "word": word.word,
-                                "start": float(word.start),
-                                "end": float(word.end),
-                                "probability": float(word.probability)
-                            }
-                            for word in seg.words
-                        ]
-                    
-                    transcript['segments'].append(segment_data)
-            
-            logger.info(f"\nProcessed {len(transcript['segments'])} valid text segments")
-            if transcript['segments']:
-                logger.info("First few processed segments:")
-                for i, seg in enumerate(transcript['segments'][:3]):
-                    logger.info(f"Segment {i}:")
-                    logger.info(f"- Time: {seg['start']:.2f}s -> {seg['end']:.2f}s")
-                    logger.info(f"- Text: '{seg['text']}'")
-                    logger.info(f"- Avg logprob: {seg['avg_logprob']:.2f}")
-                    logger.info(f"- No speech prob: {seg['no_speech_prob']:.2f}")
+            # Check cache first
+            cached_audio = self._get_cached_audio(url, start_time, end_time)
+            if cached_audio:
+                audio_file = cached_audio
+                if progress_callback:
+                    progress_callback(20)
             else:
-                logger.warning("No valid text segments found in transcription!")
-            logger.info("-" * 50)
+                # Download if not cached
+                audio_file = self.download_audio(url, start_time, end_time)
+                if progress_callback:
+                    progress_callback(20)
             
-            # Segment the audio
-            logger.info("\n[2] Segmenting audio...")
-            segments, timestamps = self._segment_audio(audio_path)
+            # Load and process audio
+            logger.info("Processing audio...")
+            logger.info(f"Loading audio file: {audio_file}")
             
-            if len(segments) == 0:
-                raise Exception("No segments were created from the audio")
+            if not Path(audio_file).exists():
+                raise Exception(f"Audio file does not exist: {audio_file}")
+                
+            audio_data, sample_rate = sf.read(audio_file)
+            logger.info(f"Audio loaded - Shape: {audio_data.shape}, Sample rate: {sample_rate}Hz")
+            logger.info(f"Duration: {len(audio_data)/sample_rate:.2f} seconds")
             
-            logger.info(f"Created {len(segments)} segments" + (" (limited by test mode)" if self.test_mode else ""))
+            # Convert to mono if stereo
+            if len(audio_data.shape) > 1:
+                logger.info(f"Converting {audio_data.shape[1]} channels to mono")
+                audio_data = np.mean(audio_data, axis=1)
             
-            # Initialize result structure
-            result = {
-                'speakers': [],
-                'segments': []
+            # Extract segment if time range specified
+            if start_time is not None and end_time is not None:
+                logger.info(f"Extracting segment from {start_time}s to {end_time}s")
+                start_sample = int(start_time * sample_rate)
+                end_sample = int(end_time * sample_rate)
+                if start_sample >= len(audio_data):
+                    raise Exception(f"Start time {start_time}s is beyond audio length {len(audio_data)/sample_rate}s")
+                if end_sample > len(audio_data):
+                    end_sample = len(audio_data)
+                audio_data = audio_data[start_sample:end_sample]
+                logger.info(f"Extracted segment - New duration: {len(audio_data)/sample_rate:.2f} seconds")
+            
+            # Resample to 16kHz if needed
+            if sample_rate != 16000:
+                logger.info(f"Resampling from {sample_rate}Hz to 16000Hz")
+                audio_data = librosa.resample(audio_data, orig_sr=sample_rate, target_sr=16000)
+                sample_rate = 16000
+            
+            if progress_callback:
+                progress_callback(40)
+            
+            # Process audio in parallel chunks
+            chunk_size = 30 * sample_rate  # 30 seconds
+            chunks = []
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:min(i + chunk_size, len(audio_data))]
+                if len(chunk) >= sample_rate:  # Only include chunks >= 1 second
+                    chunks.append(chunk)
+            
+            logger.info(f"Created {len(chunks)} chunks of {chunk_size/sample_rate:.1f} seconds each")
+            
+            if not chunks:
+                raise Exception(f"No valid chunks to process")
+            
+            # Process chunks in parallel batches
+            batch_size = min(NUM_THREADS, len(chunks))
+            results = []
+            
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                # Submit all chunks for processing
+                future_to_chunk = {
+                    executor.submit(self.process_chunk, chunk, i / sample_rate): i 
+                    for i, chunk in enumerate(chunks)
+                }
+                
+                # Process results as they complete
+                for future in future_to_chunk:
+                    chunk_idx = future_to_chunk[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            results.append(result)
+                        if progress_callback:
+                            progress = 40 + int((chunk_idx + 1) * 50 / len(chunks))
+                            progress_callback(progress)
+                    except Exception as e:
+                        logger.error(f"Error processing chunk {chunk_idx}: {str(e)}")
+                        continue
+            
+            if not results:
+                raise Exception("No valid results from audio processing")
+            
+            # Combine results
+            embedding_file = self.embeddings_dir / f"speaker_{speaker_id}.npz"
+            self.embeddings_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save combined embedding (average of all chunk embeddings)
+            embeddings = np.vstack([r['embedding'] for r in results])
+            mean_embedding = np.mean(embeddings, axis=0)
+            np.savez(str(embedding_file), embedding=mean_embedding)
+            logger.info(f"Saved voice print to {embedding_file}")
+            
+            # Combine segments
+            segments = []
+            for r in results:
+                segments.extend(r['segments'])
+            
+            # Sort segments by start time
+            segments.sort(key=lambda x: x['start'])
+            
+            combined_results = {
+                'embedding_file': str(embedding_file),
+                'segments': segments
             }
             
-            # Process segments with detailed status tracking
-            speakers = {}
-            processed_segments = []
-            all_embeddings = []
-            embedding_map = []
+            if progress_callback:
+                progress_callback(100)
             
-            # Pre-processing diagnostics
-            logger.info("\nPRE-PROCESSING DIAGNOSTICS")
-            logger.info("-" * 50)
-            logger.info(f"Total segments to process: {len(segments)}")
-            logger.info(f"Test mode enabled: {self.test_mode}")
-            logger.info(f"Transcript segments available: {len(transcript['segments'])}")
-            logger.info("-" * 50 + "\n")
-            
-            # Process each segment
-            for i, (segment, time_info) in enumerate(zip(segments, timestamps)):
-                try:
-                    logger.debug(f"\nProcessing segment {i+1}...")
-                    logger.debug(f"Time info: start={time_info['start']:.3f}s, end={time_info['end']:.3f}s")
-                    
-                    # Format timestamps using the determined format_timestamp function
-                    start_formatted = format_timestamp(time_info['start'])
-                    end_formatted = format_timestamp(time_info['end'])
-                    
-                    segment_status = {
-                        "Time Range": {
-                            "status": "success",
-                            "details": f"{start_formatted} -> {end_formatted}"
-                        },
-                        "Audio Properties": {
-                            "status": "success",
-                            "details": f"Length: {len(segment)}, Shape: {segment.shape}"
-                        }
-                    }
-                    
-                    # Extract voice embedding
-                    voice_embedding = self._extract_voice_embedding(segment)
-                    if voice_embedding is not None:
-                        segment_status["Voice Embedding"] = {
-                            "status": "success",
-                            "details": f"Shape: {voice_embedding.shape}, Mean: {np.mean(voice_embedding):.3f}"
-                        }
-                        all_embeddings.append(voice_embedding)
-                        embedding_map.append((voice_embedding, time_info))
-                    else:
-                        segment_status["Voice Embedding"] = {
-                            "status": "failure",
-                            "details": "Failed to extract embedding"
-                        }
-                        continue
-                    
-                    # Find text in time range using the transcript
-                    text = self._find_text_in_timerange(transcript, time_info["start"], time_info["end"])
-                    if text.strip():
-                        segment_status["Text Found"] = {
-                            "status": "success",
-                            "details": f"Length: {len(text)} chars | Preview: {text[:50]}..."
-                        }
-                    else:
-                        segment_status["Text Found"] = {
-                            "status": "failure",
-                            "details": "No text found in this time range"
-                        }
-                    
-                    # Print status visualization
-                    logger.info("\n" + "="*80)
-                    logger.info(f"SEGMENT {i+1} STATUS:")
-                    logger.info("="*80)
-                    for step, step_status in segment_status.items():
-                        symbol = "✓" if step_status["status"] == "success" else "✗"
-                        logger.info(f"{symbol} {step:<30} | {step_status['details']}")
-                    logger.info("-"*80)
-                    
-                    # Only continue if we have both embedding and text
-                    if voice_embedding is not None and text.strip():
-                        processed_segments.append({
-                            "start": time_info["start"],
-                            "end": time_info["end"],
-                            "text": text,
-                            "embedding": voice_embedding
-                        })
-                        
-                except Exception as e:
-                    logger.error(f"Error processing segment {i+1}: {str(e)}\n{traceback.format_exc()}")
-                    continue
-
-            # Update result with speaker information
-            if len(all_embeddings) > 0:
-                # Save the first speaker's embedding
-                speaker_id = f"speaker_{int(time.time())}"
-                embedding_file = self._save_embedding(all_embeddings[0], speaker_id)
-                result['speakers'].append({
-                    "id": speaker_id,
-                    "embedding_file": embedding_file,
-                    "segments": processed_segments
-                })
-            
-            # Final summary
-            logger.info("\n" + "="*80)
-            logger.info("PROCESSING SUMMARY")
-            logger.info("="*80)
-            logger.info(f"Total segments analyzed: {len(segments)}")
-            logger.info(f"Successful embeddings: {len(all_embeddings)}")
-            logger.info(f"Segments with text: {len(processed_segments)}")
-            logger.info(f"Processing time: {time.time() - start_processing:.2f} seconds")
-            logger.info("="*80)
-            
-            return result
+            return combined_results
             
         except Exception as e:
-            logger.error(f"Error in process_video: {str(e)}\n{traceback.format_exc()}")
+            logger.error(f"Error processing video: {str(e)}")
+            if 'embedding_file' in locals() and embedding_file.exists():
+                try:
+                    embedding_file.unlink()
+                except:
+                    pass
+            return None
+
+    def _verify_time_formatter(self):
+        """Verify that the TimeFormatter is available and working."""
+        try:
+            from utils import TimeFormatter
+            logging.info("\n[SUCCESS] OpenAI whisper format_timestamp found")
+            logging.info("[TEST] format_timestamp(123.456) = " + TimeFormatter.format_timestamp(123.456))
+        except ImportError as e:
+            logging.error("Failed to import TimeFormatter:", str(e))
+            raise 
+
+    def process_audio(self, audio_data: np.ndarray, sample_rate: int = 16000) -> List[ProcessedChunk]:
+        """Process audio data in chunks."""
+        try:
+            # Create chunks
+            chunk_size = int(CHUNK_DURATION * sample_rate)
+            chunks = []
+            
+            # Split audio into chunks
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i + chunk_size]
+                if len(chunk) < chunk_size:
+                    # Pad last chunk if needed
+                    padding = chunk_size - len(chunk)
+                    chunk = np.pad(chunk, (0, padding))
+                chunks.append(chunk)
+            
+            self.logger.info(f"Created {len(chunks)} chunks of {CHUNK_DURATION:.1f} seconds each")
+            
+            # Process chunks sequentially
+            results = []
+            for i, chunk in enumerate(chunks):
+                self.logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+                result = self.process_chunk(chunk, i * CHUNK_DURATION)
+                if result is not None:
+                    results.append(result)
+                else:
+                    self.logger.warning(f"Failed to process chunk {i+1}")
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error processing audio: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return [] 
+
+    def process_audio_file(self, audio_file: Path, start_time: float = 0.0, duration: Optional[float] = None) -> List[ProcessedChunk]:
+        """Process an audio file."""
+        try:
+            self.logger.info("Processing audio...")
+            
+            # Load audio file
+            self.logger.info(f"Loading audio file: {audio_file}")
+            audio_data, sample_rate = librosa.load(audio_file, sr=None)
+            self.logger.info(f"Audio loaded - Shape: {audio_data.shape}, Sample rate: {sample_rate}Hz")
+            self.logger.info(f"Duration: {len(audio_data)/sample_rate:.2f} seconds")
+            
+            # Convert stereo to mono if needed
+            if len(audio_data.shape) > 1:
+                self.logger.info("Converting 2 channels to mono")
+                audio_data = np.mean(audio_data, axis=1)
+            
+            # Extract segment if start_time or duration is specified
+            if start_time > 0 or duration is not None:
+                self.logger.info(f"Extracting segment from {start_time}s to {start_time + (duration or 0)}s")
+                start_sample = int(start_time * sample_rate)
+                if duration:
+                    end_sample = start_sample + int(duration * sample_rate)
+                    audio_data = audio_data[start_sample:end_sample]
+                else:
+                    audio_data = audio_data[start_sample:]
+                self.logger.info(f"Extracted segment - New duration: {len(audio_data)/sample_rate:.2f} seconds")
+            
+            # Resample to 16kHz if needed
+            if sample_rate != 16000:
+                self.logger.info(f"Resampling from {sample_rate}Hz to 16000Hz")
+                audio_data = librosa.resample(audio_data, orig_sr=sample_rate, target_sr=16000)
+                sample_rate = 16000
+            
+            # Process audio
+            return self.process_audio(audio_data, sample_rate)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing audio file: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return [] 
+
+    def create_speaker_profile(self, name: str, url: str, start_time: float = 0.0, duration: float = 30.0) -> Optional[str]:
+        """Create a speaker profile from a video segment."""
+        try:
+            self.logger.info(f"\nExtracting voice print for speaker: {name}")
+            self.logger.info(f"Source: {url}")
+            self.logger.info(f"Time range: {start_time} to {start_time + duration}")
+            
+            # Download video
+            audio_file = self.download_video(url, start_time, duration)
+            if not audio_file:
+                self.logger.error("Failed to download video")
+                return None
+            
+            # Process audio file
+            results = self.process_audio_file(audio_file, start_time, duration)
+            if not results or not results[0]:
+                self.logger.error("Failed to process audio")
+                return None
+            
+            # Get embedding from first chunk
+            embedding = results[0].embedding
+            
+            # Generate speaker ID
+            speaker_id = str(abs(hash(name + url + str(start_time))))
+            
+            # Save embedding
+            embedding_file = self.embeddings_dir / f"speaker_{speaker_id}.npz"
+            embedding_file.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(str(embedding_file), embedding=embedding)
+            self.logger.info(f"Saved voice print to {embedding_file}")
+            
+            # Set as reference speaker
+            self.set_reference_speaker(speaker_id)
+            
+            print(f"✓ Successfully added speaker: {name} (ID: {speaker_id})")
+            return speaker_id
+            
+        except Exception as e:
+            self.logger.error(f"Error creating speaker profile: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return None 
+
+    def download_video(self, url: str, start_time: float = 0.0, duration: Optional[float] = None) -> Optional[Path]:
+        """Download a video segment and return the path to the audio file."""
+        try:
+            self.logger.info(f"Downloading video: {url}")
+            
+            # Generate cache key
+            cache_key = f"{url}_{start_time:.3f}_{duration or 0:.3f}"
+            self.logger.info(f"Checking cache with key: {cache_key}")
+            
+            # Create cache directory
+            cache_dir = self.output_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate cache file path
+            import hashlib
+            cache_key_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            cache_file = cache_dir / f"audio_cache_{cache_key_hash}.wav"
+            
+            self.logger.info(f"Looking for cache file: {cache_file}")
+            
+            # Check if cached
+            if cache_file.exists():
+                self.logger.info(f"✓ Cache hit! Found cached audio file: {cache_file}")
+                return cache_file
+            
+            # Download video
+            import yt_dlp
+            
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'wav',
+                }],
+                'outtmpl': str(cache_file.with_suffix('')),
+                'quiet': True
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            
+            self.logger.info(f"✓ Successfully downloaded video to {cache_file}")
+            return cache_file
+            
+        except Exception as e:
+            self.logger.error(f"Error downloading video: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return None 
+
+    def _load_ecapa_tdnn(self) -> Any:
+        """Load the ECAPA-TDNN model."""
+        try:
+            from speechbrain.pretrained import EncoderClassifier
+            
+            # Set up model directory
+            model_dir = self.models_dir / "ecapa-tdnn"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Download model files
+            model = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=str(model_dir),
+                run_opts={"device": DEVICE}
+            )
+            
+            return model
+            
+        except Exception as e:
+            self.logger.error(f"Error loading ECAPA-TDNN model: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             raise 

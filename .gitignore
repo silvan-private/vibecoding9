@@ -4,7 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -23,21 +22,21 @@ wheels/
 
 # Virtual Environment
 venv/
+env/
 ENV/
 
-# Project specific
-cache/
-pretrained_models/
-speaker_data/
-*.wav
-*.png
-*.log
-
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
+
+# Project specific
+speaker_data/
+huggingface_cache/
+*.wav
+*.db
+*.log
 
 # OS
 .DS_Store
